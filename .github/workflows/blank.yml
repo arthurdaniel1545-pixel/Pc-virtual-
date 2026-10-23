@@ -80,4 +80,12 @@ jobs:
 
       - name: Maintain Connection
         run: |
-          Write-Host "`n=== RDP ACCESS
+          Write-Host "=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "User: RDP"
+          Write-Host "Password: the RDP_PASSWORD secret"
+          Write-Host "=================="
+          while ($true) {
+              Write-Host "RDP Active"
+              Start-Sleep -Seconds 300
+          }
