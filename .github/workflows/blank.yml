@@ -11,17 +11,11 @@ jobs:
     steps:
       - name: Configure Core RDP Settings
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
-
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User
@@ -37,11 +31,6 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
 
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
-
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
@@ -52,8 +41,7 @@ jobs:
 
       - name: Establish Tailscale Connection
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=pc-virtual
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -61,7 +49,6 @@ jobs:
               Start-Sleep -Seconds 5
               $retries++
           }
-
           if (-not $tsIP) {
               Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
@@ -83,7 +70,6 @@ jobs:
           Write-Host "=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "User: RDP"
-          Write-Host "Password: the RDP_PASSWORD secret"
           Write-Host "=================="
           while ($true) {
               Write-Host "RDP Active"
