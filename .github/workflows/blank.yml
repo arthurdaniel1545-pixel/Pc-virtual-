@@ -1,77 +1,180 @@
+
 name: RDP
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  secure-rdp:
+  rdp:
     runs-on: windows-latest
-    timeout-minutes: 1051200
+    timeout-minutes: 3600
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Configure RDP
+        shell: pwsh
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
-          Restart-Service -Name TermService -Force
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
 
-      - name: Create RDP User
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+      - name: Create RDP user
+        shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          if ([string]::IsNullOrEmpty($env:RDP_PASSWORD)) {
-              Write-Error "Secret RDP_PASSWORD is empty or missing"
-              exit 1
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Configure RDP_PASSWORD in GitHub Secrets."
           }
-          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          $secure = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name RDP -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name RDP -Password $secure -AccountNeverExpires
+          } else {
+            Set-LocalUser -Name RDP -Password $secure
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" `
+            -Member RDP -ErrorAction SilentlyContinue
+
+      - name: Check Microsoft Store
+        shell: pwsh
+        run: |
+          Write-Host "Checking Microsoft Store..."
+
+          $store = Get-AppxPackage -AllUsers `
+            -Name Microsoft.WindowsStore `
+            -ErrorAction SilentlyContinue
+
+          if ($store) {
+            Write-Host "Store package found: $($store.Version)"
+          } else {
+            Write-Warning "Microsoft Store package not found."
+
+            $manifest = "$env:windir\WinStore\AppxManifest.xml"
+
+            if (Test-Path $manifest) {
+              Add-AppxPackage -Register $manifest `
+                -DisableDevelopmentMode -ErrorAction Continue
+            } else {
+              Write-Warning "Store cannot be restored because its manifest is missing."
+            }
+          }
+
+      - name: Install VirtualBox
+        shell: pwsh
+        run: |
+          winget install --id Oracle.VirtualBox `
+            --exact --silent `
+            --accept-package-agreements `
+            --accept-source-agreements
+
+      - name: Install WinRAR
+        shell: pwsh
+        run: |
+          winget install --id RARLab.WinRAR `
+            --exact --silent `
+            --accept-package-agreements `
+            --accept-source-agreements
+
+      - name: Install Steam
+        shell: pwsh
+        run: |
+          $installer = "$env:TEMP\SteamSetup.exe"
+
+          Invoke-WebRequest `
+            -Uri "https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe" `
+            -OutFile $installer
+
+          Start-Process $installer -ArgumentList "/S" -Wait
+
+      - name: Download Kali Linux
+        shell: pwsh
+        run: |
+          $dir = "C:\Kali"
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+          Write-Host "Download Kali Linux from the official source:"
+          Write-Host "https://www.kali.org/get-kali/"
+
+          $page = Invoke-WebRequest `
+            -Uri "https://www.kali.org/get-kali/" `
+            -UseBasicParsing
+
+          $matches = [regex]::Matches(
+            $page.Content,
+            'https://[^" ]+\.7z'
+          )
+
+          if ($matches.Count -gt 0) {
+            $link = $matches[0].Value
+            Invoke-WebRequest -Uri $link -OutFile "$dir\kali.7z"
+            Write-Host "Kali archive downloaded to $dir\kali.7z"
+          } else {
+            Write-Warning "Automatic archive discovery failed."
+          }
 
       - name: Install Tailscale
+        shell: pwsh
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          $msi = "$env:TEMP\tailscale.msi"
 
-      - name: Establish Tailscale Connection
-        run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=pc-virtual
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $msi
 
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          Start-Process msiexec.exe `
+            -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
 
-      - name: Maintain Connection
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          Write-Host "=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "User: RDP"
-          Write-Host "=================="
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Configure TAILSCALE_AUTH_KEY in GitHub Secrets."
+          }
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $ts up "--authkey=$env:TS_AUTHKEY" `
+            --hostname=windows-rdp
+
+          $ip = $null
+
+          for ($i = 0; $i -lt 20; $i++) {
+            $ip = (& $ts ip -4 | Select-Object -First 1)
+            if ($ip) { break }
+            Start-Sleep -Seconds 3
+          }
+
+          if (-not $ip) {
+            throw "Tailscale IP unavailable."
+          }
+
+          "RDP_IP=$ip" >> $env:GITHUB_ENV
+
+      - name: Display connection information
+        shell: pwsh
+        run: |
+          Write-Host "Tailscale IP: $env:RDP_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Port: 3389"
+
+      - name: Keep session alive
+        shell: pwsh
+        run: |
           while ($true) {
-              Write-Host "RDP Active"
-              Start-Sleep -Seconds 300
+            Write-Host "RDP running: $(Get-Date)"
+            Start-Sleep -Seconds 60
           }
+          
