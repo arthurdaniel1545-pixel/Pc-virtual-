@@ -1,10 +1,7 @@
-name: RDP Windows
+name: RDP
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: read
 
 jobs:
   secure-rdp:
@@ -12,190 +9,107 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Configure Windows RDP
-        shell: pwsh
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $ErrorActionPreference = "Stop"
-
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "Configure o secret RDP_PASSWORD no GitHub."
+          if ([string]::IsNullOrEmpty($env:RDP_PASSWORD)) {
+              Write-Error "Secret RDP_PASSWORD is empty or missing"
+              exit 1
           }
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
 
-          $securePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD -AsPlainText -Force
-
-          $user = Get-LocalUser -Name "RDP" `
-            -ErrorAction SilentlyContinue
-
-          if (-not $user) {
-            New-LocalUser -Name "RDP" `
-              -Password $securePassword `
-              -AccountNeverExpires | Out-Null
-          } else {
-            Set-LocalUser -Name "RDP" `
-              -Password $securePassword
-          }
-
-          Add-LocalGroupMember -Group "Administrators" `
-            -Member "RDP" -ErrorAction SilentlyContinue
-
-          Set-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
-            -Name fDenyTSConnections -Value 0
-
-          Set-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name UserAuthentication -Value 1
-
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
-          Set-Service -Name TermService -StartupType Automatic
-          Start-Service -Name TermService
-
-          Write-Host "RDP configurado. NLA permanece ativado."
-
-      - name: Install applications
-        shell: pwsh
+      - name: Install Tailscale
         run: |
-          $ErrorActionPreference = "Continue"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-          $apps = @(
-            @{ Name = "7-Zip"; Id = "7zip.7zip" },
-            @{ Name = "WinRAR"; Id = "RARLab.WinRAR" },
-            @{ Name = "VirtualBox"; Id = "Oracle.VirtualBox" },
-            @{ Name = "Steam"; Id = "Valve.Steam" }
-          )
-
-          foreach ($app in $apps) {
-            Write-Host "Instalando $($app.Name)..."
-
-            winget install `
-              --id $app.Id `
-              --exact `
-              --silent `
-              --accept-package-agreements `
-              --accept-source-agreements
-
-            if ($LASTEXITCODE -eq 0) {
-              Write-Host "$($app.Name): instalador concluído."
-            } else {
-              Write-Warning "$($app.Name): instalação falhou ou não foi confirmada."
-            }
-          }
-
-      - name: Download Kali Linux ISO
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          New-Item -ItemType Directory `
-            -Path "$env:RUNNER_TEMP\Kali" -Force | Out-Null
-
-          $url = "https://cdimage.kali.org/current/kali-linux-installer-amd64.iso"
-          $file = "$env:RUNNER_TEMP\Kali\kali-linux-installer-amd64.iso"
-
-          Invoke-WebRequest -Uri $url -OutFile $file
-
-          if ((Get-Item $file).Length -lt 100MB) {
-            throw "O download da ISO parece incompleto."
-          }
-
-          Write-Host "ISO baixada. Tamanho:"
-          Get-Item $file | Select-Object Name, Length
-
-      - name: Check Microsoft Store
-        shell: pwsh
-        run: |
-          $store = Get-AppxPackage -AllUsers `
-            -Name Microsoft.WindowsStore `
-            -ErrorAction SilentlyContinue
-
-          if ($store) {
-            Write-Host "Microsoft Store encontrada."
-            $store | Select-Object Name, Version
-          } else {
-            Write-Warning "Microsoft Store não está disponível nesta imagem Windows."
-            Write-Warning "Não é possível garantir sua instalação nesta imagem do runner."
-          }
-
-      - name: Configure private Tailscale connection
-        shell: pwsh
+      - name: Establish Tailscale Connection
         env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          $ErrorActionPreference = "Stop"
-
-          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
-            throw "Configure o secret TAILSCALE_AUTH_KEY no GitHub."
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TS_KEY --hostname=pc-virtual
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
           }
-
-          $msi = "$env:RUNNER_TEMP\tailscale.msi"
-
-          Invoke-WebRequest `
-            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
-            -OutFile $msi
-
-          $install = Start-Process msiexec.exe `
-            -ArgumentList "/i `"$msi`" /quiet /norestart" `
-            -Wait -PassThru
-
-          if ($install.ExitCode -ne 0) {
-            throw "Falha na instalação do Tailscale: $($install.ExitCode)"
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
           }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          if (!(Test-Path $tailscale)) {
-            throw "Executável do Tailscale não encontrado."
-          }
-
-          & $tailscale up "--auth-key=$env:TS_AUTHKEY" `
-            "--hostname=windows-rdp"
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Falha ao conectar o Tailscale."
-          }
-
-          Write-Host "Tailscale conectado."
-
-          & $tailscale ip -4
-
-      - name: Verify RDP and installed applications
-        shell: pwsh
+      - name: Verify RDP Accessibility
         run: |
-          Write-Host "=== Estado do RDP ==="
-
-          Get-Service TermService |
-            Select-Object Name, Status, StartType
-
-          Write-Host "=== Porta local 3389 ==="
-
-          Get-NetTCPConnection -LocalPort 3389 `
-            -State Listen -ErrorAction SilentlyContinue |
-            Select-Object LocalAddress, LocalPort, State
-
-          Write-Host "=== Programas detectados ==="
-
-          foreach ($name in @(
-            "VirtualBox",
-            "WinRAR",
-            "Steam",
-            "7-Zip"
-          )) {
-            $found = Get-ItemProperty `
-              "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-              "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" `
-              -ErrorAction SilentlyContinue |
-              Where-Object { $_.DisplayName -like "*$name*" }
-
-            if ($found) {
-              Write-Host "$name: encontrado."
-            } else {
-              Write-Warning "$name: não confirmado."
-            }
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
           }
+          Write-Host "TCP connectivity successful!"
 
-          Write-Host "Verificação concluída."
-          
+      - name: Install VirtualBox and WinRAR
+        continue-on-error: true
+        run: |
+          choco install virtualbox winrar 7zip -y --no-progress
+          Write-Host "Apps installed"
+
+      - name: Download and prepare Kali Linux
+        continue-on-error: true
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $base = "https://cdimage.kali.org/current/"
+          $page = Invoke-WebRequest -Uri $base -UseBasicParsing
+          $file = $page.Links.href | Where-Object { $_ -match '^kali-linux-.*-virtualbox-amd64\.7z$' } | Select-Object -First 1
+          if (-not $file) {
+              Write-Error "Kali VirtualBox image not found"
+              exit 1
+          }
+          Write-Host "Downloading $file"
+          New-Item -ItemType Directory -Force -Path C:\VMs | Out-Null
+          curl.exe -L -o "C:\VMs\kali.7z" "$base$file"
+          & "C:\Program Files\7-Zip\7z.exe" x "C:\VMs\kali.7z" -o"C:\VMs\Kali" -y | Out-Null
+          Remove-Item "C:\VMs\kali.7z" -Force
+          $vbox = (Get-ChildItem -Path C:\VMs\Kali -Recurse -Filter *.vbox | Select-Object -First 1).FullName
+          $name = ([xml](Get-Content $vbox)).VirtualBox.Machine.name
+          $vbm = '"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"'
+          $lines = @(
+            '@echo off',
+            ($vbm + ' registervm "' + $vbox + '"'),
+            ($vbm + ' modifyvm "' + $name + '" --memory 4096 --cpus 2'),
+            ($vbm + ' startvm "' + $name + '" --type gui'),
+            'echo Usuario: kali  Senha: kali',
+            'pause'
+          )
+          Set-Content -Path "C:\Users\Public\Desktop\Iniciar Kali.bat" -Value $lines -Encoding ASCII
+          Write-Host "Kali ready: $name"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "User: RDP"
+          Write-Host "=================="
+          while ($true) {
+              Write-Host "RDP Active"
+              Start-Sleep -Seconds 300
+          }
