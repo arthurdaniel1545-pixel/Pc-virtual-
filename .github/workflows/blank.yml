@@ -1,5 +1,4 @@
-
-name: RDP
+name: RDP Windows
 
 on:
   workflow_dispatch:
@@ -8,173 +7,195 @@ permissions:
   contents: read
 
 jobs:
-  rdp:
+  secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
 
     steps:
-      - name: Configure RDP
-        shell: pwsh
-        run: |
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name fDenyTSConnections -Value 0
-
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name UserAuthentication -Value 1
-
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
-      - name: Create RDP user
+      - name: Configure Windows RDP
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "Configure RDP_PASSWORD in GitHub Secrets."
+            throw "Configure o secret RDP_PASSWORD no GitHub."
           }
 
-          $secure = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
 
-          if (-not (Get-LocalUser -Name RDP -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name RDP -Password $secure -AccountNeverExpires
+          $user = Get-LocalUser -Name "RDP" `
+            -ErrorAction SilentlyContinue
+
+          if (-not $user) {
+            New-LocalUser -Name "RDP" `
+              -Password $securePassword `
+              -AccountNeverExpires | Out-Null
           } else {
-            Set-LocalUser -Name RDP -Password $secure
+            Set-LocalUser -Name "RDP" `
+              -Password $securePassword
           }
 
-          Add-LocalGroupMember -Group "Remote Desktop Users" `
-            -Member RDP -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" `
+            -Member "RDP" -ErrorAction SilentlyContinue
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name fDenyTSConnections -Value 0
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name UserAuthentication -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Write-Host "RDP configurado. NLA permanece ativado."
+
+      - name: Install applications
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $apps = @(
+            @{ Name = "7-Zip"; Id = "7zip.7zip" },
+            @{ Name = "WinRAR"; Id = "RARLab.WinRAR" },
+            @{ Name = "VirtualBox"; Id = "Oracle.VirtualBox" },
+            @{ Name = "Steam"; Id = "Valve.Steam" }
+          )
+
+          foreach ($app in $apps) {
+            Write-Host "Instalando $($app.Name)..."
+
+            winget install `
+              --id $app.Id `
+              --exact `
+              --silent `
+              --accept-package-agreements `
+              --accept-source-agreements
+
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "$($app.Name): instalador concluído."
+            } else {
+              Write-Warning "$($app.Name): instalação falhou ou não foi confirmada."
+            }
+          }
+
+      - name: Download Kali Linux ISO
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory `
+            -Path "$env:RUNNER_TEMP\Kali" -Force | Out-Null
+
+          $url = "https://cdimage.kali.org/current/kali-linux-installer-amd64.iso"
+          $file = "$env:RUNNER_TEMP\Kali\kali-linux-installer-amd64.iso"
+
+          Invoke-WebRequest -Uri $url -OutFile $file
+
+          if ((Get-Item $file).Length -lt 100MB) {
+            throw "O download da ISO parece incompleto."
+          }
+
+          Write-Host "ISO baixada. Tamanho:"
+          Get-Item $file | Select-Object Name, Length
 
       - name: Check Microsoft Store
         shell: pwsh
         run: |
-          Write-Host "Checking Microsoft Store..."
-
           $store = Get-AppxPackage -AllUsers `
             -Name Microsoft.WindowsStore `
             -ErrorAction SilentlyContinue
 
           if ($store) {
-            Write-Host "Store package found: $($store.Version)"
+            Write-Host "Microsoft Store encontrada."
+            $store | Select-Object Name, Version
           } else {
-            Write-Warning "Microsoft Store package not found."
-
-            $manifest = "$env:windir\WinStore\AppxManifest.xml"
-
-            if (Test-Path $manifest) {
-              Add-AppxPackage -Register $manifest `
-                -DisableDevelopmentMode -ErrorAction Continue
-            } else {
-              Write-Warning "Store cannot be restored because its manifest is missing."
-            }
+            Write-Warning "Microsoft Store não está disponível nesta imagem Windows."
+            Write-Warning "Não é possível garantir sua instalação nesta imagem do runner."
           }
 
-      - name: Install VirtualBox
+      - name: Configure private Tailscale connection
         shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          winget install --id Oracle.VirtualBox `
-            --exact --silent `
-            --accept-package-agreements `
-            --accept-source-agreements
+          $ErrorActionPreference = "Stop"
 
-      - name: Install WinRAR
-        shell: pwsh
-        run: |
-          winget install --id RARLab.WinRAR `
-            --exact --silent `
-            --accept-package-agreements `
-            --accept-source-agreements
-
-      - name: Install Steam
-        shell: pwsh
-        run: |
-          $installer = "$env:TEMP\SteamSetup.exe"
-
-          Invoke-WebRequest `
-            -Uri "https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe" `
-            -OutFile $installer
-
-          Start-Process $installer -ArgumentList "/S" -Wait
-
-      - name: Download Kali Linux
-        shell: pwsh
-        run: |
-          $dir = "C:\Kali"
-          New-Item -ItemType Directory -Path $dir -Force | Out-Null
-
-          Write-Host "Download Kali Linux from the official source:"
-          Write-Host "https://www.kali.org/get-kali/"
-
-          $page = Invoke-WebRequest `
-            -Uri "https://www.kali.org/get-kali/" `
-            -UseBasicParsing
-
-          $matches = [regex]::Matches(
-            $page.Content,
-            'https://[^" ]+\.7z'
-          )
-
-          if ($matches.Count -gt 0) {
-            $link = $matches[0].Value
-            Invoke-WebRequest -Uri $link -OutFile "$dir\kali.7z"
-            Write-Host "Kali archive downloaded to $dir\kali.7z"
-          } else {
-            Write-Warning "Automatic archive discovery failed."
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Configure o secret TAILSCALE_AUTH_KEY no GitHub."
           }
 
-      - name: Install Tailscale
-        shell: pwsh
-        run: |
-          $msi = "$env:TEMP\tailscale.msi"
+          $msi = "$env:RUNNER_TEMP\tailscale.msi"
 
           Invoke-WebRequest `
             -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
             -OutFile $msi
 
-          Start-Process msiexec.exe `
-            -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+          $install = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$msi`" /quiet /norestart" `
+            -Wait -PassThru
 
-      - name: Connect Tailscale
-        shell: pwsh
-        env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
-            throw "Configure TAILSCALE_AUTH_KEY in GitHub Secrets."
+          if ($install.ExitCode -ne 0) {
+            throw "Falha na instalação do Tailscale: $($install.ExitCode)"
           }
 
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          & $ts up "--authkey=$env:TS_AUTHKEY" `
-            --hostname=windows-rdp
-
-          $ip = $null
-
-          for ($i = 0; $i -lt 20; $i++) {
-            $ip = (& $ts ip -4 | Select-Object -First 1)
-            if ($ip) { break }
-            Start-Sleep -Seconds 3
+          if (!(Test-Path $tailscale)) {
+            throw "Executável do Tailscale não encontrado."
           }
 
-          if (-not $ip) {
-            throw "Tailscale IP unavailable."
+          & $tailscale up "--auth-key=$env:TS_AUTHKEY" `
+            "--hostname=windows-rdp"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha ao conectar o Tailscale."
           }
 
-          "RDP_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "Tailscale conectado."
 
-      - name: Display connection information
+          & $tailscale ip -4
+
+      - name: Verify RDP and installed applications
         shell: pwsh
         run: |
-          Write-Host "Tailscale IP: $env:RDP_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Port: 3389"
+          Write-Host "=== Estado do RDP ==="
 
-      - name: Keep session alive
-        shell: pwsh
-        run: |
-          while ($true) {
-            Write-Host "RDP running: $(Get-Date)"
-            Start-Sleep -Seconds 60
+          Get-Service TermService |
+            Select-Object Name, Status, StartType
+
+          Write-Host "=== Porta local 3389 ==="
+
+          Get-NetTCPConnection -LocalPort 3389 `
+            -State Listen -ErrorAction SilentlyContinue |
+            Select-Object LocalAddress, LocalPort, State
+
+          Write-Host "=== Programas detectados ==="
+
+          foreach ($name in @(
+            "VirtualBox",
+            "WinRAR",
+            "Steam",
+            "7-Zip"
+          )) {
+            $found = Get-ItemProperty `
+              "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+              "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" `
+              -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -like "*$name*" }
+
+            if ($found) {
+              Write-Host "$name: encontrado."
+            } else {
+              Write-Warning "$name: não confirmado."
+            }
           }
+
+          Write-Host "Verificação concluída."
           
