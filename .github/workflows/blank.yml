@@ -9,6 +9,9 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Checkout (para pegar o wallpaper)
+        uses: actions/checkout@v4
+
       - name: Configure Core RDP Settings
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
@@ -17,6 +20,67 @@ jobs:
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
           Restart-Service -Name TermService -Force
+
+      - name: Configure pt-BR (idioma, teclado ABNT2, fuso horario)
+        continue-on-error: true
+        run: |
+          # Fuso horario e regiao (Brasil)
+          Set-TimeZone -Id "E. South America Standard Time"
+          Set-WinHomeLocation -GeoId 32
+          Set-Culture pt-BR
+          Set-WinSystemLocale pt-BR
+
+          # Pacote de idioma (pode demorar / nem sempre disponivel no runner)
+          try {
+              Install-Language -Language pt-BR -ErrorAction Stop
+          } catch {
+              Write-Host "Install-Language indisponivel: $($_.Exception.Message)"
+          }
+
+          # Idioma + teclado ABNT2 para o usuario atual
+          try {
+              $list = New-WinUserLanguageList pt-BR
+              $list[0].InputMethodTips.Clear()
+              $list[0].InputMethodTips.Add('0416:00010416')
+              Set-WinUserLanguageList $list -Force
+          } catch {
+              Write-Host "Set-WinUserLanguageList falhou: $($_.Exception.Message)"
+          }
+
+          # Copia configuracoes para tela de login e novos usuarios
+          try { Copy-UserInternationalSettingsToSystem -WelcomeScreen $true -NewUser $true } catch { Write-Host "Copy-UserInternationalSettingsToSystem indisponivel" }
+
+          # Perfil padrao (usado quando o usuario RDP fizer o primeiro login)
+          reg load HKU\DefaultUser C:\Users\Default\NTUSER.DAT
+          reg add "HKU\DefaultUser\Control Panel\International" /v LocaleName /t REG_SZ /d "pt-BR" /f
+          reg add "HKU\DefaultUser\Control Panel\International" /v Locale /t REG_SZ /d "00000416" /f
+          reg add "HKU\DefaultUser\Control Panel\International" /v sShortDate /t REG_SZ /d "dd/MM/yyyy" /f
+          reg add "HKU\DefaultUser\Control Panel\International" /v sDecimal /t REG_SZ /d "," /f
+          reg add "HKU\DefaultUser\Keyboard Layout\Preload" /v 1 /t REG_SZ /d "00010416" /f
+          [gc]::Collect()
+          Start-Sleep -Seconds 2
+          reg unload HKU\DefaultUser
+
+      - name: Configure Wallpaper
+        continue-on-error: true
+        run: |
+          $src = Join-Path $env:GITHUB_WORKSPACE "wallpaper.jpg"
+          if (-not (Test-Path $src)) {
+              Write-Error "wallpaper.jpg nao encontrado na raiz do repositorio"
+              exit 1
+          }
+          $dest = "C:\Windows\Web\Wallpaper\wallpaper.jpg"
+          Copy-Item $src $dest -Force
+
+          # Papel de parede padrao para novos perfis (usuario RDP)
+          reg load HKU\DefaultUser C:\Users\Default\NTUSER.DAT
+          reg add "HKU\DefaultUser\Control Panel\Desktop" /v Wallpaper /t REG_SZ /d $dest /f
+          reg add "HKU\DefaultUser\Control Panel\Desktop" /v WallpaperStyle /t REG_SZ /d "10" /f
+          reg add "HKU\DefaultUser\Control Panel\Desktop" /v TileWallpaper /t REG_SZ /d "0" /f
+          [gc]::Collect()
+          Start-Sleep -Seconds 2
+          reg unload HKU\DefaultUser
+          Write-Host "Wallpaper configurado"
 
       - name: Create RDP User
         env:
